@@ -207,10 +207,25 @@
   function setLoading(on){$('#loader').style.display=on?'flex':'none'}
   function uuid(){return (Date.now().toString(36)+Math.random().toString(36).slice(2,10));}
 
-  const bridgeState = {frame:null,ready:false,origin:'',pending:new Map(),waiters:[]};
+  const bridgeState = {frame:null,ready:false,target:null,origin:'',channel:'',pending:new Map(),waiters:[]};
+  function bridgeChannel(){
+    if(bridgeState.channel) return bridgeState.channel;
+    try{
+      const a=new Uint8Array(16); crypto.getRandomValues(a);
+      bridgeState.channel=Array.from(a,x=>x.toString(16).padStart(2,'0')).join('');
+    }catch(e){ bridgeState.channel=uuid()+uuid(); }
+    return bridgeState.channel;
+  }
   function bridgeSrc(){
     if(!GAS_URL) return '';
-    return GAS_URL + (GAS_URL.includes('?')?'&':'?') + 'bridge=1';
+    const sep=GAS_URL.includes('?')?'&':'?';
+    return GAS_URL+sep+'bridge=1&channel='+encodeURIComponent(bridgeChannel());
+  }
+  function isGoogleBridgeOrigin(origin){
+    try{
+      const h=new URL(origin).hostname.toLowerCase();
+      return h==='script.google.com' || h==='script.googleusercontent.com' || h.endsWith('.googleusercontent.com');
+    }catch(e){ return false; }
   }
   function initBridge(){
     if(bridgeState.frame) return;
@@ -224,23 +239,24 @@
     document.body.appendChild(f);
   }
   window.addEventListener('message',function(event){
-    if(!bridgeState.frame || event.source!==bridgeState.frame.contentWindow) return;
-    if(!/^https:\/\/script\.google(?:usercontent)?\.com$/i.test(event.origin)) return;
-    if(bridgeState.origin && event.origin!==bridgeState.origin) return;
     const msg=event.data||{};
+    if(msg.channel!==bridgeState.channel) return;
+    if(!isGoogleBridgeOrigin(event.origin)) return;
     if(msg.financebot_bridge==='ready'){
+      bridgeState.target=event.source;
       bridgeState.origin=event.origin;
       bridgeState.ready=true;
       bridgeState.waiters.splice(0).forEach(x=>x.resolve(true));
       return;
     }
     if(msg.financebot_bridge==='response' && msg.id){
+      if(!bridgeState.ready || event.source!==bridgeState.target || event.origin!==bridgeState.origin) return;
       const p=bridgeState.pending.get(String(msg.id));
       if(!p) return;
       bridgeState.pending.delete(String(msg.id));
       clearTimeout(p.timer);
       if(msg.ok) p.resolve(msg.data);
-      else p.reject(new Error(msg.error||'Ошибка Apps Script bridge'));
+      else p.reject(new Error(msg.error||'Apps Script bridge error'));
     }
   });
   function waitBridge(){
@@ -251,22 +267,22 @@
       bridgeState.waiters.push(item);
       setTimeout(()=>{
         const i=bridgeState.waiters.indexOf(item); if(i>=0) bridgeState.waiters.splice(i,1);
-        if(!bridgeState.ready) reject(new Error('Не удалось подключиться к Google Apps Script. Проверьте развертывание Web App и доступ «Все».'));
-      },12000);
+        if(!bridgeState.ready) reject(new Error('Не удалось подключиться к Google Apps Script. Обновите Bridge.html и новую версию Web App.'));
+      },15000);
     });
   }
   async function call(method,args){
     args=args||[];
-    if(!GAS_URL) throw new Error('Не найден адрес backend. Откройте Mini App кнопкой «Финансы» в боте после повторного подключения GitHub Pages.');
+    if(!GAS_URL) throw new Error('Не найден адрес backend.');
     await waitBridge();
     const id=uuid();
     const payload=args.length>1?args[1]:null;
     return new Promise((resolve,reject)=>{
-      const timer=setTimeout(()=>{bridgeState.pending.delete(id);reject(new Error('Apps Script не ответил за 25 секунд.'));},25000);
+      const timer=setTimeout(()=>{bridgeState.pending.delete(id);reject(new Error('Apps Script timeout'));},25000);
       bridgeState.pending.set(id,{resolve,reject,timer});
-      bridgeState.frame.contentWindow.postMessage({
-        financebot_bridge:'call',id:id,method:String(method||''),initData:String(args[0]||INIT_DATA||''),payload:payload
-      },bridgeState.origin||'*');
+      bridgeState.target.postMessage({
+        financebot_bridge:'call',channel:bridgeState.channel,id:id,method:String(method||''),initData:String(args[0]||INIT_DATA||''),payload:payload
+      },bridgeState.origin);
     });
   }
   async function api(method,payload){
@@ -348,7 +364,7 @@
       <div class="section"><div class="section-head"><div class="section-title">Счета</div><button class="link-btn" data-action="add-account">+ Добавить</button></div><div class="card">${d.accounts.map(a=>`<div class="account"><div class="account-icon">${a.is_default?'⭐':'💰'}</div><div class="grow"><div class="title">${esc(a.name)}</div><div class="sub">${a.is_default?'Основной счёт':'Нажмите ⭐, чтобы сделать основным'}</div></div><div class="account-actions"><div class="amount">${money(a.balance,c)}</div>${!a.is_default?`<button class="delete-mini star" data-default-account="${esc(a.id)}">★</button>`:''}</div></div>`).join('')}</div></div>
       <div class="section"><div class="section-head"><div class="section-title">Бюджеты</div><button class="link-btn" data-action="add-budget">+ Лимит</button></div>${d.budgets.length?`<div class="card">${d.budgets.map(b=>`<div style="display:flex;align-items:center;gap:8px"><div class="grow">${budgetHtml(b,c)}</div><button class="delete-mini" data-del-budget="${esc(b.id)}">✕</button></div>`).join('')}</div>`:`<div class="card empty">Лимиты не установлены</div>`}</div>
       <div class="section"><div class="section-head"><div class="section-title">Регулярные операции</div><button class="link-btn" data-action="add-recurring">+ Добавить</button></div>${d.recurring.length?`<div class="card">${d.recurring.map(r=>`<div class="rec"><div>${r.type==='income'?'➕':'➖'}</div><div class="grow"><div class="title">${esc(r.description)}</div><div class="sub">${money(r.amount,c)} · ${r.day} числа · след. ${esc(r.next_date)}</div></div><button class="switch ${r.active?'on':''}" data-toggle-rec="${esc(r.id)}"><i></i></button><button class="delete-mini" data-del-rec="${esc(r.id)}">✕</button></div>`).join('')}</div>`:`<div class="card empty">Регулярных операций пока нет</div>`}</div>
-      <div class="section"><div class="card"><div class="title">Настройки</div><div class="sub" style="margin-top:8px">Валюта: ${esc(c)} · Часовой пояс: ${esc(d.user.timezone)}</div><div class="sub">Данные хранятся в вашей Google-таблице FinanceBot.</div><div class="sub">Интерфейс: v3.1 · банковские иконки</div></div></div>`;
+      <div class="section"><div class="card"><div class="title">Настройки</div><div class="sub" style="margin-top:8px">Валюта: ${esc(c)} · Часовой пояс: ${esc(d.user.timezone)}</div><div class="sub">Данные хранятся в вашей Google-таблице FinanceBot.</div><div class="sub">Интерфейс: v3.4 · банковские иконки</div></div></div>`;
   }
 
   function showPage(p){state.page=p;$$('.page').forEach(x=>x.classList.toggle('active',x.dataset.page===p));$$('[data-nav]').forEach(x=>x.classList.toggle('active',x.dataset.nav===p));window.scrollTo({top:0,behavior:'smooth'});vibrate('success')}
